@@ -215,7 +215,7 @@ class SequenceEvaluator:
         # Optionally force a deterministic weak→strong order for the final plan
         try:
             import os
-            force_weak_first = os.environ.get('SEQ_FORCE_WEAK_FIRST', '0') == '1'
+            force_weak_first = os.environ.get('SEQ_FORCE_WEAK_FIRST', '1') == '1'
         except Exception:
             force_weak_first = False
 
