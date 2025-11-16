@@ -29,7 +29,7 @@ class SequenceFeatureExtractor:
         features = []
         
         # Basic properties
-        combo_types = ['single', 'pair', 'triple', 'straight', 'quad']
+        combo_types = ['single', 'pair', 'triple', 'straight', 'four_kind']
         combo_type = combo['combo_type']
         for ct in combo_types:
             features.append(1.0 if ct == combo_type else 0.0)
@@ -72,7 +72,7 @@ class SequenceFeatureExtractor:
         features.append(max(strengths) - min(strengths))  # strength_range
         
         # Combo distribution
-        combo_types = ['single', 'pair', 'triple', 'straight', 'quad']
+        combo_types = ['single', 'pair', 'triple', 'straight', 'four_kind']
         type_counts = [sum(1 for c in combos if c['combo_type'] == ct) for ct in combo_types]
         total_combos = len(combos)
         type_distribution = [count / total_combos for count in type_counts]
@@ -123,7 +123,7 @@ class SequenceFeatureExtractor:
         features.append(strength_variance)
         
         # Type preferences
-        combo_types_list = ['single', 'pair', 'triple', 'straight', 'quad']
+        combo_types_list = ['single', 'pair', 'triple', 'straight', 'four_kind']
         type_counts = [sum(1 for c in combos if c['combo_type'] == ct) for ct in combo_types_list]
         total_combos = len(combos)
         type_prefs = [count / total_combos for count in type_counts]

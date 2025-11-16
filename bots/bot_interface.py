@@ -5,7 +5,7 @@ This interface is intentionally placed in ai_common so it can be reused by
 any backend service without coupling to a particular web framework.
 
 Contract:
-- choose_move(hand, legal_moves, game_state) -> {"type": "play_cards"|"pass", "cards": [Card]}
+- choose_move(hand, game_state) -> {"type": "play_cards"|"pass", "cards": [Card]}
 - get_info() -> metadata for logging/debugging {name, type, version}
 """
 
@@ -23,7 +23,6 @@ class BotInterface:
     def choose_move(
         self,
         hand: List[Card],
-        legal_moves: List[Any],
         game_state: GameState,
     ) -> Dict[str, Any]:
         raise NotImplementedError

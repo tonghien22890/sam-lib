@@ -20,6 +20,12 @@ class UnbeatableProbabilityCalculator:
         """
         Calculate probability that sequence is unbeatable
         
+        Logic: Báo Sâm probability = strength của combo yếu gần nhất (combo thứ 2 yếu nhất)
+        - Sort strengths từ mạnh → yếu
+        - Lấy strength của combo yếu thứ 2 (combo cuối cùng là combo yếu nhất, dùng để kết thúc)
+        
+        Ví dụ: [1.0, 0.9, 0.55, 0.1] → prob = 0.55
+        
         Args:
             sequence: List of combo dictionaries
             
@@ -29,15 +35,20 @@ class UnbeatableProbabilityCalculator:
         if not sequence:
             return 0.0
         
-        strengths = [ComboAnalyzer.calculate_combo_strength(combo) for combo in sequence]
+        if len(sequence) == 1:
+            # Chỉ có 1 combo → chắc chắn báo được
+            return 1.0
         
-        # Simple heuristic based on strengths
-        avg_strength = np.mean(strengths)
-        max_strength = max(strengths)
-        strong_count = sum(1 for s in strengths if s >= 0.8)
+        # Tính unbeatable strength của tất cả combo (cho Báo Sâm logic)
+        strengths = [ComboAnalyzer.calculate_unbeatable_strength(combo) for combo in sequence]
         
-        # Probability calculation
-        prob = (avg_strength * 0.4 + max_strength * 0.4 + (strong_count / len(strengths)) * 0.2)
+        # Sort từ mạnh → yếu
+        sorted_strengths = sorted(strengths, reverse=True)
+        
+        # Lấy combo yếu thứ 2 (bỏ combo yếu nhất vì nó dùng để kết thúc)
+        # Ví dụ: [1.0, 0.9, 0.55, 0.1] → lấy 0.55 (index -2)
+        prob = sorted_strengths[-2]
+        
         return min(1.0, max(0.0, prob))
     
     @staticmethod
@@ -78,6 +89,7 @@ class UnbeatableProbabilityCalculator:
                 'pattern_used': 'unknown'
             }
         
+        # Use combo_strength for stats (represents actual power)
         strengths = [ComboAnalyzer.calculate_combo_strength(combo) for combo in sequence]
         
         return {

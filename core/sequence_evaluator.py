@@ -5,7 +5,7 @@ Evaluates top sequences from a hand using beam search and rule-based scoring
 """
 
 import itertools
-from typing import List, Dict, Any, Tuple, Set
+from typing import List, Dict, Any, Tuple, Set, Optional
 from collections import defaultdict
 import sys
 import os
@@ -24,15 +24,9 @@ class SequenceEvaluator:
     Rule-based sequence evaluator that finds top-k strongest sequences from a hand
     """
     
-    def __init__(self, enforce_full_coverage: bool = True, coverage_weight: float = 0.25):
+    def __init__(self, enforce_full_coverage: bool = True):
         self.combo_analyzer = ComboAnalyzer()
-        self.combo_types = ['single', 'pair', 'triple', 'quad', 'straight', 'double_seq']
-        # If true, extend sequences with planned cleanup (pairs then singles) so they cover the entire hand
         self.enforce_full_coverage = enforce_full_coverage
-        # Weight to reward higher coverage in the scoring function (applies even if not strictly enforced)
-        self.coverage_weight = coverage_weight
-        # Weight to reward weak→strong ordering inside the plan (0-0.5 reasonable)
-        self.order_weight = float(os.environ.get('SEQ_ORDER_WEIGHT', '0.15')) if 'os' in globals() else 0.15
         
     def evaluate_top_sequences(self, hand: List[int], k: int = 3, beam_size: int = 50, enforce_full_coverage: bool = None) -> List[Dict[str, Any]]:
         """
@@ -58,28 +52,36 @@ class SequenceEvaluator:
         if enforce_full_coverage is None:
             enforce_full_coverage = self.enforce_full_coverage
 
+        # Prepare card availability map
+        rank_to_cards = self._build_rank_to_cards(hand)
+        
         # Find all possible combos from hand
-        all_combos = self._find_all_combos(hand)
+        all_combos = self._find_all_combos(rank_to_cards)
         
         # Use beam search to find top sequences
-        sequences = self._beam_search_sequences(all_combos, hand, beam_size)
+        sequences = self._beam_search_sequences(all_combos, rank_to_cards, beam_size)
         
         # Score and rank sequences
         scored_sequences = []
         for sequence in sequences:
             score = self._score_sequence(sequence, hand, enforce_full_coverage)
+            combo_count = len(score['sequence'])
+            avg_strength = score['total_strength'] / max(1, combo_count)
+            
+            ordered_sequence = self._order_sequence(score['sequence'])
+            
             scored_sequences.append({
-                'sequence': score['sequence'],
+                'sequence': ordered_sequence,
                 'total_strength': score['total_strength'],
                 'coverage_score': score['coverage_score'],
                 'end_rule_compliance': score['end_rule_compliance'],
                 'used_cards': score['used_cards'],
-                'combo_count': len(score['sequence']),
-                'avg_combo_strength': score['total_strength'] / max(1, len(score['sequence']))
+                'combo_count': combo_count,
+                'avg_combo_strength': avg_strength
             })
         
-        # Sort by total strength (descending)
-        scored_sequences.sort(key=lambda x: x['total_strength'], reverse=True)
+        # Sort by average combo strength (descending) - prefer fewer, stronger combos
+        scored_sequences.sort(key=lambda x: x['avg_combo_strength'], reverse=True)
         
         topk = scored_sequences[:k]
 
@@ -106,91 +108,286 @@ class SequenceEvaluator:
 
         return topk
     
-    def _find_all_combos(self, hand: List[int]) -> List[Dict[str, Any]]:
-        """Find all possible combos from hand using ComboAnalyzer (supports long straights)"""
-        # Use ComboAnalyzer to get all combos (including long straights 3-10 cards)
-        raw_combos = self.combo_analyzer.analyze_hand(hand)
-        
-        # Convert to our format and add strength
+    def _build_rank_to_cards(self, hand: List[int]) -> Dict[int, List[int]]:
+        rank_to_cards: Dict[int, List[int]] = {}
+        for card in sorted(hand):
+            rank = card % 13
+            rank_to_cards.setdefault(rank, []).append(card)
+        return rank_to_cards
+    
+    def _find_all_combos(self, rank_to_cards: Dict[int, List[int]]) -> List[Dict[str, Any]]:
+        """Find ALL possible combos from hand (not just greedy optimal)"""
         combos = []
-        for combo in raw_combos:
-            combos.append({
-                'type': combo['combo_type'],
-                'rank_value': combo['rank_value'],
-                'cards': combo['cards'],
-                'strength': self.combo_analyzer.calculate_combo_strength(combo)
-            })
+        
+        # Generate singles, pairs, triples, four_kinds from each rank
+        for rank, cards in rank_to_cards.items():
+            # Singles
+            for card in cards:
+                card_ranks = [rank]
+                combos.append({
+                    'type': 'single',
+                    'rank_value': rank,
+                    'cards': card_ranks,
+                    'strength': self._calculate_strength_from_ranks('single', rank, card_ranks, rank_to_cards)
+                })
+            
+            # Pairs
+            if len(cards) >= 2:
+                card_ranks = [rank, rank]
+                combos.append({
+                    'type': 'pair',
+                    'rank_value': rank,
+                    'cards': card_ranks,
+                    'strength': self._calculate_strength_from_ranks('pair', rank, card_ranks, rank_to_cards)
+                })
+            
+            # Triples
+            if len(cards) >= 3:
+                card_ranks = [rank, rank, rank]
+                combos.append({
+                    'type': 'triple',
+                    'rank_value': rank,
+                    'cards': card_ranks,
+                    'strength': self._calculate_strength_from_ranks('triple', rank, card_ranks, rank_to_cards)
+                })
+            
+            # Four of a kind
+            if len(cards) >= 4:
+                card_ranks = [rank, rank, rank, rank]
+                combos.append({
+                    'type': 'four_kind',
+                    'rank_value': rank,
+                    'cards': card_ranks,
+                    'strength': self._calculate_strength_from_ranks('four_kind', rank, card_ranks, rank_to_cards)
+                })
+        
+        # Generate all possible straights (3+ consecutive ranks, allowing wrap-around)
+        combos.extend(self._generate_straight_combos(rank_to_cards))
+        
+        # Generate all possible double_seqs (3+ consecutive pairs)
+        pair_ranks = sorted([r for r, cards in rank_to_cards.items() if len(cards) >= 2])
+        for length in range(3, len(pair_ranks) + 1):
+            for start_idx in range(len(pair_ranks) - length + 1):
+                window = pair_ranks[start_idx:start_idx + length]
+                
+                # Check if consecutive
+                if all(window[i+1] - window[i] == 1 for i in range(len(window) - 1)):
+                    double_seq_cards = []
+                    for r in window:
+                        double_seq_cards.extend([r, r])
+                    
+                    combos.append({
+                        'type': 'double_seq',
+                        'rank_value': window[0],
+                        'cards': double_seq_cards,
+                        'strength': self._calculate_strength_from_ranks('double_seq', window[0], double_seq_cards, rank_to_cards)
+                    })
         
         return combos
     
-    def _beam_search_sequences(self, combos: List[Dict[str, Any]], hand: List[int], beam_size: int) -> List[List[Dict[str, Any]]]:
-        """Use beam search to find top sequences"""
+    def _generate_straight_combos(self, rank_to_cards: Dict[int, List[int]]) -> List[Dict[str, Any]]:
+        combos: List[Dict[str, Any]] = []
+        ranks = sorted(rank_to_cards.keys())
+        if not ranks:
+            return combos
+        
+        extended = ranks + [r + 13 for r in ranks if r < 12]
+        seen: Set[Tuple[int, ...]] = set()
+        
+        for i in range(len(extended)):
+            start = extended[i]
+            last = start - 1
+            window: List[int] = []
+            for j in range(i, len(extended)):
+                current = extended[j]
+                if current != last + 1:
+                    break
+                if current - start > 12:
+                    break
+                actual_rank = current % 13
+                if actual_rank not in rank_to_cards:
+                    break
+                window.append(actual_rank)
+                last = current
+                
+                if len(window) >= 3:
+                    signature = tuple(window)
+                    if 12 in signature and 0 not in signature:
+                        continue
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    combos.append({
+                        'type': 'straight',
+                        'rank_value': signature[0],
+                        'cards': list(signature),
+                        'strength': self._calculate_strength_from_ranks('straight', signature[0], list(signature), rank_to_cards)
+                    })
+        return combos
+    
+    def _order_sequence(self, sequence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not sequence:
+            return sequence
+        
+        seq = sorted(sequence, key=lambda c: c.get('strength', 0.0))
+        strengths = [c.get('strength', 0.0) for c in seq]
+        second_weakest = strengths[1] if len(strengths) > 1 else strengths[0]
+        
+        if second_weakest <= 0.5:
+            return seq  # keep weak→strong
+        
+        weakest = seq.pop(0) if seq else None
+        strongest = seq.pop(-1) if seq else None
+        ordered = seq  # already sorted weak→strong
+        if strongest is not None:
+            ordered.append(strongest)
+        if weakest is not None:
+            ordered.append(weakest)
+        return ordered
+    
+    def _calculate_strength_from_ranks(self, combo_type: str, rank_value: int, card_ranks: List[int], rank_to_cards: Dict[int, List[int]]) -> float:
+        sample_cards = self._sample_cards_from_ranks(card_ranks, rank_to_cards)
+        if not sample_cards:
+            return 0.0
+        combo_payload = {
+            'combo_type': combo_type,
+            'rank_value': rank_value,
+            'cards': sample_cards
+        }
+        return self.combo_analyzer.calculate_combo_strength(combo_payload)
+    
+    def _sample_cards_from_ranks(self, card_ranks: List[int], rank_to_cards: Dict[int, List[int]]) -> List[int]:
+        temp_usage: Dict[int, int] = {}
+        taken: List[int] = []
+        for rank in card_ranks:
+            usage = temp_usage.get(rank, 0)
+            cards = rank_to_cards.get(rank, [])
+            if usage >= len(cards):
+                return []
+            taken.append(cards[usage])
+            temp_usage[rank] = usage + 1
+        return taken
+    
+    def _beam_search_sequences(self, combos: List[Dict[str, Any]], rank_to_cards: Dict[int, List[int]], beam_size: int) -> List[List[Dict[str, Any]]]:
+        """Generate top sequences using priority-guided greedy construction"""
         if not combos:
             return []
         
-        # Prefer exploring weaker combos first to encourage weak→strong ordering
-        combos.sort(key=lambda x: x['strength'])
+        top_sequences: List[List[Dict[str, Any]]] = []
+        seen_signatures = set()
         
-        # Initialize beam with empty sequences
-        beam = [{'sequence': [], 'used_cards': set(), 'remaining_cards': set(hand)}]
+        # Sort combos by priority and intrinsic strength
+        sorted_combos = sorted(
+            combos,
+            key=lambda c: (
+                self._combo_priority(c.get('type')),
+                c.get('strength', 0.0),
+                len(c.get('cards', []))
+            ),
+            reverse=True
+        )
         
-        for _ in range(min(len(combos), 10)):  # Limit depth to avoid explosion
-            new_beam = []
+        top_avg_threshold = 0.0
+        
+        for start_combo in sorted_combos:
+            start_strength = start_combo.get('strength', 0.0)
+            if len(top_sequences) >= beam_size and start_strength <= top_avg_threshold:
+                break
             
-            for state in beam:
-                remaining_cards = state['remaining_cards']
-                
-                # Try adding each combo that doesn't conflict
-                for combo in combos:
-                    combo_cards = set(combo['cards'])
-                    
-                    # Check if combo can be added (no card conflicts)
-                    if combo_cards.issubset(remaining_cards):
-                        new_sequence = state['sequence'] + [combo]
-                        new_used_cards = state['used_cards'] | combo_cards
-                        new_remaining = remaining_cards - combo_cards
-                        
-                        new_beam.append({
-                            'sequence': new_sequence,
-                            'used_cards': new_used_cards,
-                            'remaining_cards': new_remaining
-                        })
-                
-                # Also keep the current state (don't add any combo)
-                new_beam.append(state)
+            sequence = self._build_sequence_from_start(start_combo, sorted_combos, rank_to_cards)
+            if not sequence:
+                continue
             
-            # Keep top beam_size sequences by order-aware, coverage-aware average strength
-            def partial_score(state):
-                seq = state['sequence']
-                if not seq:
-                    return 0.0
-                avg = sum(c['strength'] for c in seq) / len(seq)
-                # partial coverage
-                cov = (len(state['used_cards']) / len(hand)) if hand else 0.0
-                # order compliance on partial
-                strengths = [c.get('strength', 0.0) for c in seq]
-                good = sum(1 for i in range(len(strengths)-1) if strengths[i] <= strengths[i+1] + 1e-9)
-                pairs = max(1, len(strengths) - 1)
-                order = good / pairs
-                score = avg * (1.0 + self.coverage_weight * cov) * (1.0 + self.order_weight * (order - 0.5))
-                return score
-
-            new_beam.sort(key=partial_score, reverse=True)
-            beam = new_beam[:beam_size]
+            signature = tuple(sorted(
+                (c.get('type'), c.get('rank_value'), len(c.get('cards', [])))
+                for c in sequence
+            ))
+            if signature in seen_signatures:
+                continue
+            
+            seen_signatures.add(signature)
+            top_sequences.append(self._order_sequence(sequence))
+            
+            if len(top_sequences) >= beam_size:
+                # Estimate avg strength for thresholding using raw strengths
+                scored = sorted(
+                    (
+                        sum(c.get('strength', 0.0) for c in seq) / max(1, len(seq)),
+                        seq
+                    )
+                    for seq in top_sequences
+                )
+                top_sequences = [seq for _, seq in scored[-beam_size:]]
+                top_avg_threshold = scored[-beam_size][0]
         
-        # Return just the sequences
-        return [state['sequence'] for state in beam if state['sequence']]
+        return top_sequences
+    
+    def _combo_priority(self, combo_type: str) -> int:
+        priority_map = {
+            'four_kind': 6,
+            'double_seq': 5,
+            'straight': 4,
+            'triple': 3,
+            'pair': 2,
+            'single': 1,
+            'pass': 0
+        }
+        return priority_map.get(combo_type or 'single', 1)
+    
+    def _build_sequence_from_start(self, start_combo: Dict[str, Any], sorted_combos: List[Dict[str, Any]], rank_to_cards: Dict[int, List[int]]) -> List[Dict[str, Any]]:
+        available = {rank: list(cards) for rank, cards in rank_to_cards.items()}
+        
+        start_cards = self._consume_cards_for_combo(start_combo, available)
+        if start_cards is None:
+            return []
+        
+        sequence = [self._with_cards(start_combo, start_cards)]
+        
+        for combo in sorted_combos:
+            if combo is start_combo:
+                continue
+            combo_cards = self._consume_cards_for_combo(combo, available)
+            if combo_cards is None:
+                continue
+            sequence.append(self._with_cards(combo, combo_cards))
+        
+        return self._order_sequence(sequence)
+    
+    def _consume_cards_for_combo(self, combo: Dict[str, Any], available: Dict[int, List[int]]) -> Optional[List[int]]:
+        card_ranks = combo.get('cards', [])
+        if not card_ranks:
+            return []
+        
+        demand: Dict[int, int] = {}
+        for rank in card_ranks:
+            demand[rank] = demand.get(rank, 0) + 1
+        
+        for rank, count in demand.items():
+            if len(available.get(rank, [])) < count:
+                return None
+        
+        taken: List[int] = []
+        for rank in card_ranks:
+            pool = available.get(rank, [])
+            chosen = pool.pop()
+            taken.append(chosen)
+        
+        return taken
+    
+    def _with_cards(self, combo: Dict[str, Any], cards: List[int]) -> Dict[str, Any]:
+        new_combo = dict(combo)
+        new_combo['cards'] = cards
+        return new_combo
     
     def _score_sequence(self, sequence: List[Dict[str, Any]], hand: List[int], enforce_full_coverage: bool) -> Dict[str, Any]:
-        """Score a sequence. Optionally extend it to full coverage and score the full plan."""
+        """Score a sequence and optionally extend to full coverage"""
         if not sequence:
             return {
                 'sequence': [],
                 'total_strength': 0.0,
                 'coverage_score': 0.0,
                 'end_rule_compliance': True,
-                'used_cards': set(),
-                'order_compliance': 0.0
+                'used_cards': set()
             }
         
         # Calculate used cards
@@ -211,39 +408,15 @@ class SequenceEvaluator:
                 for combo in cleanup:
                     used_cards.update(combo['cards'])
                 coverage_score = len(used_cards) / len(hand)
-        
-        # Optionally force a deterministic weak→strong order for the final plan
-        try:
-            import os
-            force_weak_first = os.environ.get('SEQ_FORCE_WEAK_FIRST', '1') == '1'
-        except Exception:
-            force_weak_first = False
 
-        if force_weak_first and extended_sequence:
-            extended_sequence = sorted(extended_sequence, key=lambda c: c.get('strength', 0.0))
-
-        # Calculate average strength over the PLAN we present (extended if needed)
-        total_strength = sum(combo['strength'] for combo in extended_sequence) / max(1, len(extended_sequence))
-
-        # Apply a small reward for coverage
-        total_strength = total_strength * (1.0 + self.coverage_weight * coverage_score)
-
-        # Order compliance bonus: prefer weak→strong progression
-        strengths = [c.get('strength', 0.0) for c in extended_sequence]
-        order_pairs = 0
-        good_pairs = 0
-        for i in range(len(strengths) - 1):
-            order_pairs += 1
-            if strengths[i] <= strengths[i + 1] + 1e-9:
-                good_pairs += 1
-        order_compliance = (good_pairs / order_pairs) if order_pairs > 0 else 1.0
-        total_strength = total_strength * (1.0 + self.order_weight * (order_compliance - 0.5))
+        # Calculate total strength (sum of all combo strengths)
+        total_strength = sum(combo['strength'] for combo in extended_sequence)
 
         # Check end rule compliance (not ending with 2 or quad)
         last_combo = extended_sequence[-1]
         end_rule_compliance = not (
             (last_combo['rank_value'] == 12) or  # Not ending with 2
-            (last_combo['type'] == 'quad')       # Not ending with quad
+            (last_combo['type'] == 'four_kind')       # Not ending with quad
         )
         
         return {
@@ -251,23 +424,20 @@ class SequenceEvaluator:
             'total_strength': total_strength,
             'coverage_score': coverage_score,
             'end_rule_compliance': end_rule_compliance,
-            'used_cards': used_cards,
-            'order_compliance': order_compliance
+            'used_cards': used_cards
         }
 
     def _build_cleanup_from_remaining(self, remaining_cards: List[int]) -> List[Dict[str, Any]]:
-        """Build planned cleanup from remaining cards.
-        Strategy: collect pairs and singles, then globally sort by strength ascending (weak→strong)
-        so singles are not always pushed to the end.
-        """
+        """Build cleanup combos from remaining cards (pairs + singles)"""
         # Group by rank
         rank_to_cards = {}
         for c in remaining_cards:
             r = c % 13
             rank_to_cards.setdefault(r, []).append(c)
 
-        combos: List[Dict[str, Any]] = []
-        # Create candidate pairs
+        combos = []
+        
+        # Create pairs first
         for r, cards in rank_to_cards.items():
             if len(cards) >= 2:
                 pair_cards = cards[:2]
@@ -292,9 +462,6 @@ class SequenceEvaluator:
                         'combo_type': 'single', 'rank_value': r, 'cards': [c]
                     })
                 })
-
-        # Global weak→strong ordering across both pairs and singles
-        combos.sort(key=lambda x: x.get('strength', 0.0))
 
         return combos
     
